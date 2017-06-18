@@ -1,6 +1,7 @@
 import argparse
 from base64 import b64encode
 import bson
+from datetime import datetime
 import logging
 from pathlib import Path
 import pymongo
@@ -53,7 +54,8 @@ def dump_oplog_main():
         if latest_ts is not None:
             break
 
-    logger.debug('latest_ts: %r', latest_ts)
+    if latest_ts:
+        logger.debug('latest_ts: %r - %s', latest_ts, datetime.utcfromtimestamp(latest_ts[0]))
 
     latest_number = sorted(dump_files.keys())[-1] if dump_files else -1
     current_number = latest_number + 1
@@ -62,31 +64,46 @@ def dump_oplog_main():
     q = {'ts': {'$gte': bson.Timestamp(*(latest_ts or [0, 0]))}}
     logger.debug('q: %r', q)
     oplog_cursor = c_oplog.find(q, cursor_type=pymongo.CursorType.TAILABLE, oplog_replay=True)
+    first = True
     try:
         while oplog_cursor.alive:
             for doc in oplog_cursor:
-                row = {
-                    'ts': [doc['ts'].time, doc['ts'].inc],
-                    'op': doc['op'],
-                    'ns': doc.get('ns'),
-                }
-                if doc['op'] in ('n', 'c'):
-                    row['o'] = to_json(doc['o'])
-                    row['raw'] = to_json(doc)
-                else:
-                    row['_id'] = to_json(doc['o']['_id'])
-                row_json = json.dumps(row, sort_keys=True)
-                assert '\n' not in row_json
-                if current_file and current_file.tell() > dump_file_size_limit:
-                    logger.debug('File size limit reached, closing %s', current_file)
-                    current_file.close()
-                    current_file = None
-                    current_number += 1
-                if current_file is None:
-                    current_file_path = dump_path / (dump_prefix + '{:09d}'.format(current_number))
-                    logger.debug('Writing into %s', current_file_path)
-                    current_file = current_file_path.open('x')
-                current_file.write(row_json + '\n')
+                try:
+                    if first:
+                        if latest_ts:
+                            if latest_ts != [doc['ts'].time, doc['ts'].inc]:
+                                logger.warning('oplog ts %r != latest_ts %r', doc['ts'], latest_ts)
+                        else:
+                            logger.info('oplog starts at %r - %s', doc['ts'], datetime.utcfromtimestamp(doc['ts'].time))
+                        first = False
+                    row = {
+                        'ts': [doc['ts'].time, doc['ts'].inc],
+                        'op': doc['op'],
+                        'ns': doc.get('ns'),
+                    }
+                    if doc['op'] in ('n', 'c'):
+                        row['o'] = to_json(doc['o'])
+                        row['raw'] = to_json(doc)
+                    elif doc['op'] in ('i', 'd'):
+                        row['_id'] = to_json(doc['o']['_id'])
+                    elif doc['op'] == 'u':
+                        row['_id'] = to_json(doc['o2']['_id'])
+                    else:
+                        raise Exception('Unknown op {!r}'.format(doc['op']))
+                    row_json = json.dumps(row, sort_keys=True)
+                    assert '\n' not in row_json
+                    if current_file and current_file.tell() > dump_file_size_limit:
+                        logger.debug('File size limit reached, closing %s', current_file)
+                        current_file.close()
+                        current_file = None
+                        current_number += 1
+                    if current_file is None:
+                        current_file_path = dump_path / (dump_prefix + '{:09d}'.format(current_number))
+                        logger.debug('Writing into %s', current_file_path)
+                        current_file = current_file_path.open('x')
+                    current_file.write(row_json + '\n')
+                except Exception as e:
+                    raise Exception('Failed to process oplog doc {!r}: {!r}'.format(doc, e)) from e
             current_file.flush()
             sleep(0.1)
     finally:
