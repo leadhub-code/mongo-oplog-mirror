@@ -1,0 +1,5 @@
+src_mongo:
+    uri: mongodb://root:rootpwd@127.0.0.1:27017/admin
+oplog_dump:
+    path: .
+    file_name_prefix: dump.
